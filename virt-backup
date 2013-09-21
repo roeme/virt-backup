@@ -1,0 +1,436 @@
+#!/bin/zsh -u
+set -o nounset
+
+# virt-backup
+#
+# This script creates a backup of a domain.
+
+# Variables to tweak this script to your environment ****** 
+# TODO: make configurable by means of config script, try to
+# 	do it like other libvirt / virt-tools
+# TODO: make this handle multiple domains?
+# TODO: Handle traps
+# TODO: implement dry run?
+# NOTE: Paths are relative to executing host unless noted otherwise
+
+export VBS_MODE="suspend"
+
+# where to store backups
+export VBS_BACKUPLOC=/tmp/backup
+
+# where should additional error log output be put?
+export VBS_ERRLOG=/tmp/vbs.err
+
+# abort when maximum allowed capacity for domain exceeds backup
+# location size, or just warn? ("warn" or "abort")
+# note that physically used capacity may be (and often is) lower.
+# the script will always abort if the physical used capacity exceeds 
+# available storage
+export VBS_ABORT_OVERCAP=warn
+
+
+# some helper functions ***********************************
+# Abort function
+# Pass message in $1, exit code in $2
+die() {
+	echo -en "${RED}"
+	vbs_log "ABORT: ${1}" crit
+	vbs_log "Check $VBS_ERRLOG for more information"
+	echo -en "${NORMAL}"
+	exit ${2:-1}
+}
+# Send a warning log message
+warn() {
+	echo -en "${YELLOW}"
+	vbs_log "Warning: ${1}" warn
+	echo -en "${NORMAL}"
+}
+# Messages sent here are only displayed in verbose mode
+verboselog() {
+	[[ -z "${VBS_VERBOSE:-}" ]] || vbs_log "${1}"
+}
+
+# Logging Function
+# Pass message in $1
+# Optionally specify level of message in $2 as string (see man syslog(3)) 
+# When $2 is set, a message will be sent to syslog with the specified level.
+# Use this with caution, or you may piss off someone
+vbs_log() {
+	echo -e "[`date +%H:%M:%S`] $0: $1"
+	if [[ -n ${2:-} ]]; then logger -p local0.$2 -t "${0}[$$]" "$1" ; fi
+}
+# Display Usage and Exit
+usage() {
+	pod2usage --verbose 1 $0
+	exit
+}
+
+# colors
+GREEN=$(tput setaf 2; tput bold)
+BOLD=$(tput bold)
+YELLOW=$(tput setaf 3)
+RED=$(tput setaf 1)
+NORMAL=$(tput sgr0)
+
+# bootstrap ***********************************************
+{
+
+	# set some stuff for zsh (suppress error for other shells)
+	unsetopt FUNCTION_ARGZERO 2>/dev/null
+	# consume options
+	while getopts 'c:dvhm' OPTION
+	do
+		case $OPTION in
+			c)  export VBS_HYPERVISOR=${OPTARG:-}
+				[[ -n "${VBS_HYPERVISOR:-}" ]] || die "-c passed with empty arg?!"
+				;;
+			d)	export VBS_DRYRUN=1 
+				die "Sorry, dry run not implemented yet!"
+				#vbs_log "*** DRY RUN: not modifying anything."
+				;;
+			v)	export VBS_VERBOSE=1
+				vbs_log "Verbose mode selected"
+				;;
+			h)	usage
+				;;
+			m)	pod2usage --verbose 3 $0
+				exit
+				;;
+			?)	usage
+				;;
+		esac
+	done
+	# clean out options that have been read
+	shift $(( $OPTIND - 1 ))
+	# the domain that shall be backed up
+	vbs_domname="${1:-}"
+
+	# catch PEBKAC
+	[[ -n "$vbs_domname" ]] || die "...I'm useless without a domname."
+
+	# block device(s) to backup (if any)
+	shift 1 2>/dev/null
+	vbs_blkdevs_requested=(${*:-})
+	
+	# check for valid backup mode
+	validmodes="shutdown suspend"
+	[[ $validmodes =~ $VBS_MODE ]] || die "Backup mode '$VBS_MODE' unknown or net yet implemented"
+
+	# redirect STDERR, prepending timestamps
+	echo "File truncated." > ${VBS_ERRLOG}
+	errlog() { while IFS='' read -r line; do echo "[$(date +%H:%M:%S)] $line" >> ${VBS_ERRLOG}; done; };
+	exec 2> >(errlog)
+	echo "Redirection set up" >&2
+	verboselog ">> Detailed error messages will be recorded to ${VBS_ERRLOG} <<"
+
+	# instruct virsh to connect differently if necessary
+	if [[ -n ${VBS_HYPERVISOR:-} ]]; then
+		export LIBVIRT_DEFAULT_URI=$VBS_HYPERVISOR
+	fi
+
+	# persistent timestamp in case run time overlaps midnight
+	declare -rx VBS_TODAY=`date '+%Y%m%d-%H%M'`
+
+	verboselog "Bootstrap done."
+}
+
+# preflight: **********************************************
+#
+#	Check that everything is in order and sane
+#
+{
+	verboselog "Preflight checks:"
+
+	# TODO virsh / libvirt version is enough for chosen backup mode
+	virsh -v >/dev/null || die "virsh is not available on this system"
+	lzop -V >/dev/null || die "lzop is not available on this system"
+
+	# - domain is there?
+	verboselog "Validating domain '$vbs_domname'"
+	vbs_domstate=`virsh -r domstate $vbs_domname` || die "Could not validate domain '$vbs_domname'"
+
+	# - get domain's block devices and their source
+	verboselog "Enumerating block devices of '$vbs_domname':"
+	vbs_blkdevs_info=`virsh -q -r domblklist --details $vbs_domname | awk '$2 == "disk" {print $3,$1,$4}'`
+	# $vbs_blkdevs_info now contains lines of the following format:
+	# <vm disk target identifier (vda,hda,...)> <type of disk (net,file,...)> <>
+	if [[ $? -ne 0 ]] || [[ -z "${vbs_blkdevs_info:-}" ]]; then
+		die "Error while enumerating block devs of '$vbs_domname', or found none"
+	else
+		verboselog "Found Devices:\n\t $vbs_blkdevs_info\n"
+		vbs_blkdevs=$(echo "$vbs_blkdevs_info" | awk "{print \$1}")
+	fi
+
+	# - if particular blkdevs were requested, are they even known to the domain?
+	for blkdev in ${vbs_blkdevs_requested:-}; do
+		virsh -q -r domblkinfo $vbs_domname $blkdev >/dev/null || die "Requested to backup ${(j:,:)vbs_blkdevs_requested}, but $blkdev is not known for this domain!"
+	done
+
+	# are the blkdevs accessible to this script (important if hypervisor and this 
+	# script are not located on the same machine)
+	for blkdev in ${vbs_blkdevs_requested:-$vbs_blkdevs}; do
+		blkdev_source=`echo "$vbs_blkdevs_info" | awk "\\$1 == \"${blkdev}\" {print \\$3 }"`
+		if [[ ! -r $blkdev_source ]]; then
+			die "This process cannot access the domain's blockdev '$blkdev' (at $blkdev_source)"
+		fi
+	done
+
+	# - is the backup location is available?
+	verboselog "Checking availability of backup location."
+	if [[ ! -w ${VBS_BACKUPLOC} || ! -d ${VBS_BACKUPLOC} ]]; then
+		die "Backup location (${VBS_BACKUPLOC}) not existing or not writable!"
+	fi
+
+	# - does the backup loc have enough space?
+	# TODO add conservative factor
+	verboselog "Checking free space at backup location."
+	vbs_bkup_free1kblks=`df -kP ${VBS_BACKUPLOC} | grep -P "\S+(\s+\d+){3}" | sed -e 's/[ \t][ \t]*/ /g' | cut -d ' ' -f 4`
+	verboselog "$vbs_bkup_free1kblks 1k blocks free"
+
+	# Determine dom storage requirements (if no blkdev given, sum all)
+	verboselog "Checking storage requirements of domain."
+	for blkdev in ${vbs_blkdevs_requested:-$vbs_blkdevs}; do
+		blkdev_info=`virsh -q -r domblkinfo $vbs_domname $blkdev`
+		# sum physically used bytes (NOTE: equals capacity for blk devices)
+		vbs_cum_blkdevs_phys=$(( ${cum_blkdev_phys:-0} + $(echo "$blkdev_info" | awk '{s=tolower($0)} s~/phys/ {print $2}') ))
+		# sum available bytes
+		vbs_cum_blkdevs_capa=$(( ${cum_blkdev_phys:-0} + $(echo "$blkdev_info" | awk '{s=tolower($0)} s~/capa/ {print $2}') ))
+	done
+	verboselog "Domain storage usage in bytes:\n\tPhysical:\t$vbs_cum_blkdevs_phys\n\tMax Capacity:\t$vbs_cum_blkdevs_capa"
+
+	if (( ($vbs_cum_blkdevs_phys / 1024) > $vbs_bkup_free1kblks )); then
+		die "Domain needs more space than backup location has available!"
+	else
+		verboselog "Backup location has enough free space."
+	fi
+	if (( ($vbs_cum_blkdevs_capa / 1024) > $vbs_bkup_free1kblks )); then
+		case ${VBS_ABORT_OVERCAP:-warn} in
+			warn)
+				warn "Domain has more max. capacity allocated than available space at backup location!"
+				;;
+			abort)
+				die "Domain has more max. capacity allocated than available space at backup location, aborting as requested."
+				;;
+		esac
+	fi
+
+	verboselog "${GREEN}Preflight checks done, ready to go.${NORMAL}"
+}
+
+
+# main: ******************************************************
+#
+#
+#
+#	TODO: Refactor this into phases
+{
+	vbs_log "Starting backup of ${vbs_domname}." info
+
+	# prepare
+	#mkdir -p "${VBS_BACKUPLOC}/${VBS_TODAY}"
+
+	# shutdown/suspend domain if needed
+	# be smart about it
+	if [[ "`virsh -q -r domstate ${vbs_domname}`" = "shut off" ]] {
+		vbs_log "Domain is shut off - changing backup mode to 'offline'" info
+		VBS_MODE="offline"
+	}
+	case $VBS_MODE in
+		shutdown)
+			verboselog "Requesting ${vbs_domname} domain to shutdown."
+			virsh -q shutdown "${vbs_domname}" || die "Couldn't shutdown ${vbs_domname} !"
+			# wait until shut down
+			verboselog "Waiting for domain to complete shutdown..."
+			while ( "`virsh -q -r domstate ${vbs_domname}`" != "shut off" ); do
+				# TODO add timeout
+				sleep 1
+			done
+			verboselog "${vbs_domname} shutdown complete."
+			;;
+		suspend)
+			verboselog "Suspending (saving) ${vbs_domname}..."
+			virsh -q save "${vbs_domname}" "${VBS_BACKUPLOC}/${vbs_domname}-${VBS_TODAY}.state" >&2 || die "Couldn't suspend ${vbs_domname} !"
+			verboselog "Suspended and saved."
+			;;
+		*)
+			die "Internal Error, an illegal backup mode ($VBS_MODE) was selected?!"
+			;;
+	esac
+	
+	# backup config
+	verboselog "Backing up ${vbs_domname}..."
+	verboselog "Dumping XML config."
+	virsh -q -r dumpxml $vbs_domname > "${VBS_BACKUPLOC}/${vbs_domname}-${VBS_TODAY}.xml" || warn "There was an error dumping the XML config, continuing anyway..."
+
+	# backup disks
+	for blkdev in ${vbs_blkdevs_requested:-$vbs_blkdevs}; do
+		verboselog "Backing up ${blkdev}..."
+		# determine type of backing storage
+		blkdev_source=`echo "$vbs_blkdevs_info" | awk "\\$1 == \"${blkdev}\" {print \\$3 }"`
+		case `echo "$vbs_blkdevs_info" | awk "\\$1 == \"${blkdev}\" {print \\$2 }"` in
+			file)
+				# just copy the image
+				archname="${VBS_BACKUPLOC}/${vbs_domname}-${blkdev}-${VBS_TODAY}.tar.lzo"
+				verboselog "Archiving original image ${blkdev_source} to ${archname}"
+				tar -Scf - "${blkdev_source}" | lzop -o "${archname}"
+				[[ $pipestatus =~ "1" ]] && backuperr=1
+				# TODO tar sparse files?
+				verboselog "finished copying ${blkdev_source}."
+				;;
+			block)
+				# this is a bit more complicated.
+				# TODO - shall we even handle this?
+				# idea would be to create a qcow img and pull blocks from the backing image
+				;;
+		esac
+	done
+	verboselog "No more disks left to backup."
+
+	# start/resume domain if needed
+	case $VBS_MODE in
+		offline)
+			verboselog "Offline backup; not starting the domain"
+			;;
+		suspend)
+			verboselog "Resuming (restoring) ${vbs_domname}..."
+			virsh -q restore "${VBS_BACKUPLOC}/${vbs_domname}-${VBS_TODAY}.state" >&2 || warn "Could not resume domain?!"
+			;;
+		shutdown)
+			verboselog "Starting ${vbs_domname}."
+			virsh -q start ${vbs_domname} || warn "Could not start domain?!"
+			;;
+	esac
+
+	# workaround until we have phases
+	if [[ -n ${backuperr:-} ]]; then
+		echo -en "$RED"
+		vbs_log "There was an error while backing up the disks of ${vbs_domname}. Please check ${VBS_ERRLOG}" crit
+		echo -en "$NORMAL"
+	else
+		echo -en "${GREEN}"
+		vbs_log "Backup of $vbs_domname has finished." info
+		echo -en "${NORMAL}"
+	fi
+}
+
+# ***********************************************************
+
+exit 0
+=pod
+
+=head1 NAME
+
+virt-backup - backup libvirt domains
+
+
+=head1 SYNOPSIS
+
+virt-backup OPTIONS domainname [[blkdev] ...]
+
+=head1 ARGUMENTS
+
+=over
+
+=item domainname
+
+The domain you want to back up.
+
+=item blkdev
+
+EXPERIMENTAL: If you want to backup only a specific disk of the domain, 
+specify its name here. Multiple names can be given separated by spaces.
+
+=back
+
+=head1 OPTIONS
+
+=over
+
+=item -h
+
+Show usage
+
+=item -m
+
+Show manpage
+
+=item -c [libvirt-uri]
+
+Use hypervisor at [libvirt-uri] instead of the default.
+
+=item -v
+
+Be chatty. But you knew that, didn't you?
+
+=back
+
+=head1 DESCRIPTION
+
+B<virt-backup> is used to backup a virtual machine (domain) managed by libvirt.
+It will archive the configuration, and disks as seperate files in a directory 
+you specify. Depending on the backup mode (see L</Backup Modes>) 
+and wether the domain is running, the  domain's state (RAM) will be archived as 
+well.
+
+This script may be executed on a different machine than the hypervisor, in which
+case you must make sure that the paths as seen by the hypervisor are accessible
+in the same form on the machine the script runs on.
+
+=head2 About logging
+
+B<virt-backup> by default keeps very silent, writing just both start and end as 
+informational level messages to your syslog and stdout.
+
+Any problems will be written on stdout and sent with the appropiate
+level to syslog as well. Note that any error messages generated by external 
+tools are redirected to an seperate logfile.
+
+Selecting verbose mode will print a lot more informational messages on stdout,
+but these will not be sent to syslog nor recorded.
+
+=head2 Backup Modes
+
+B<Please note:> Depending on your libvirt and hypervisor version (and 
+combinations thereof), some of these modes may not be supported. Consult with
+the according documentation, and test first. (Since there are a lot of possible
+combinations, virt-backup cannot [yet] do this for you).
+
+=over
+
+=item	shutdown
+
+Properly shutdown the domain prior to backup, restart it afterwards. This 
+requires that you have set up your hypervisor to be able to signal the domains
+OS to do a regular shutdown (qemu-ga, ACPI, ...)
+
+=item	suspend
+
+halt the domain prior to backup, backup both RAM and disk, resume
+it afterwards. Backup is consistent, in a live state. dowtime
+for the duration of the backup. You need some kind of proper 
+timekeeping in your domain, or else the time will be way off after resuming.
+
+=item	snapshot-libvirt
+
+B<NOT YET IMPLEMENTED> take a live snapshot of the domain with
+libvirt, backup both RAM and disk, and discard the 
+snapshot afterwards. backup is consistent, in a live state. 
+No measurable downtime.
+
+=item	snapshot-dm
+
+B<NOT YET IMPLEMENTED> halt the domain, write out RAM to disk,
+then take a devicemapper snapshot and resume the domain.
+backup both disk and ram, and discard the snapshot afterwards.
+Backup is consistent, in a live state, very short downtime. This requires the
+path where the domain's disk reside to be mounted through the devicemapper 
+(or LVM). 
+
+=back
+
+=head1 EXIT CODES
+
+Any exit code >0 signifies an error, and a possibly unsucessful backup. Check
+the error log.
+
+=cut
