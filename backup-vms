@@ -1,0 +1,28 @@
+#!/bin/bash -u
+set -o nounset
+
+# backup-vms
+#
+# This script does backups of multiple domains by using
+# virt-backup.
+#
+# vms to be backed up are to be noted in a file
+BV_CONFFILE=./backup-vms.conf
+# vms that have been backed up sucessfully shall be recorded in this file
+BV_LOGBACKUP=/var/log/vms-backed-up.log
+
+while read domname; do
+	while read line; do
+		if [[ "$line" =~ \# || -z "$line" ]]; then continue; fi
+		if [[ "$line" =~ \! ]]; then
+			line="${line##\!}"
+			if [[ "$domname" =~ $line ]]; then
+				# do not back up this machine, continue with next one
+				break
+			fi
+		elif [[ "$domname" =~ $line ]]; then
+			virt-backup $domname
+			break
+		fi
+	done < $BV_CONFFILE
+done < <(virsh -q -r list --name)

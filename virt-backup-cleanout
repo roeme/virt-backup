@@ -1,0 +1,45 @@
+#!/bin/bash -u
+shopt -s extglob
+
+# virt-backup-cleanout
+#
+# This script cleans out expired backups created by virt-backup
+#
+# TODO: allow safely for dashes in domain name
+
+# where backups are stored
+export VBC_BACKUPLOC=/srv/vm-backup
+
+# how old must the backup files be before they 
+# are considered expired?
+# (specify in days)
+export VBC_MINAGE=30
+
+# how many newer versions of the files must exist
+# before they may be removed?
+# Setting 0 here will be ignored for sanity reasons
+export VBC_MINREVS=2
+
+# 1. find files with specified age, write to temp file
+tempfoo=`basename $0`
+TMPFILE=`mktemp /tmp/${tempfoo}-$$.XXXXXX` || exit 1
+find "$VBC_BACKUPLOC" -xdev -type f -mtime +$VBC_MINAGE >> $TMPFILE
+
+while read candidate; do
+	# 2. loop through files, search for newer ones...
+	pattern=`basename $candidate`
+	pattern=${pattern/-+([0-9-])/*}
+	count=$(( `find "$VBC_BACKUPLOC" -xdev -type f -newer "$candidate" -name $pattern | wc -l` ))
+
+	if [[ $count -gt 0 && $count -ge $VBC_MINREVS ]]; then
+		# candidate may be cleaned out!
+		rm $candidate
+	else
+		echo "Did not delete expired backup file $candidate 
+because there were not enough newer versions: >=${VBC_MINREVS}, but got ${count}. (Also, sanity requires >0)"
+	fi
+
+done <$TMPFILE
+
+# cleanup
+rm $TMPFILE
