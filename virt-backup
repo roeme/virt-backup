@@ -9,7 +9,7 @@ set -o nounset
 # TODO: make configurable by means of config script, try to
 # 	do it like other libvirt / virt-tools
 # TODO: make this handle multiple domains?
-# TODO: Handle traps
+# TODO: Handle traps / errexit
 # TODO: implement dry run?
 # NOTE: Paths are relative to executing host unless noted otherwise
 # TODO: delete old backups
@@ -30,30 +30,20 @@ export VBS_ABORT_OVERCAP=warn
 
 
 # some helper functions ***********************************
-
-# colors, set only when interactive tty
-if [[ -t 1 ]]; then
-	GREEN=$(tput setaf 2; tput bold)
-	BOLD=$(tput bold)
-	YELLOW=$(tput setaf 3)
-	RED=$(tput setaf 1)
-	NORMAL=$(tput sgr0)
-fi
-
 # Abort function
 # Pass message in $1, exit code in $2
 die() {
-	echo -en "${RED}"
+	echo -en "${RED:-}"
 	vbs_log "ABORT: ${1}" crit
 	vbs_log "Check $VBS_ERRLOG for more information"
-	echo -en "${NORMAL}"
+	echo -en "${NORMAL:-}"
 	exit ${2:-1}
 }
 # Send a warning log message
 warn() {
-	echo -en "${YELLOW}"
+	echo -en "${YELLOW:-}"
 	vbs_log "Warning: ${1}" warn
-	echo -en "${NORMAL}"
+	echo -en "${NORMAL:-}"
 }
 # Messages sent here are only displayed in verbose mode
 verboselog() {
@@ -74,6 +64,15 @@ usage() {
 	pod2usage --verbose 1 $0
 	exit
 }
+
+# colors, set only when a tty is here
+if $( tty -s ); then
+	GREEN=$(tput setaf 2; tput bold)
+	BOLD=$(tput bold)
+	YELLOW=$(tput setaf 3)
+	RED=$(tput setaf 1)
+	NORMAL=$(tput sgr0)
+fi
 
 # bootstrap ***********************************************
 {
