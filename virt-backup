@@ -28,6 +28,10 @@ export VBS_ERRLOG=/tmp/vbs.err
 # available storage
 export VBS_ABORT_OVERCAP=warn
 
+# maximum time to wait for VM's for shutting down
+# seconds.
+export VBS_MAXSHUTTIME=300
+
 
 # some helper functions ***********************************
 # Abort function
@@ -244,7 +248,10 @@ fi
 			# wait until shut down
 			verboselog "Waiting for domain to complete shutdown..."
 			while ( "`virsh -q -r domstate ${vbs_domname}`" != "shut off" ); do
-				# TODO add timeout
+				i=$(( ${i:0} + 1 ))
+				if [[ $i -gt $VBS_MAXSHUTTIME ]]; then
+					die "Timed out while waiting for VM to be shut down! The shutdown could be still in progress, but this process aborts now. The VM will not be restarted automatically."
+				fi
 				sleep 1
 			done
 			verboselog "${vbs_domname} shutdown complete."
@@ -411,6 +418,12 @@ halt the domain prior to backup, backup both RAM and disk, resume
 it afterwards. Backup is consistent, in a live state. dowtime
 for the duration of the backup. You need some kind of proper 
 timekeeping in your domain, or else the time will be way off after resuming.
+
+=item blockcopy
+
+B<NOT YET IMPLEMENTED> backup the disk(s) of the domain while it's running,
+then halt it while backing up the RAM. backup ist consistent, in a live state.
+Downtime for the duration of RAM backup.
 
 =item	snapshot-libvirt
 
