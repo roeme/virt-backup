@@ -261,6 +261,9 @@ fi
 			virsh -q save "${vbs_domname}" "${VBS_BACKUPLOC}/${vbs_domname}-${VBS_TODAY}.state" >&2 || die "Couldn't suspend ${vbs_domname} !"
 			verboselog "Suspended and saved."
 			;;
+		offline)
+			verboselog "Offline backup of ${vbs_domname}, continuing to next phase."
+			;;
 		*)
 			die "Internal Error, an illegal backup mode ($VBS_MODE) was selected?!"
 			;;
